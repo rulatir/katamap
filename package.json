@@ -1,0 +1,16 @@
+{
+  "name": "katamap",
+  "version": "1.0.0",
+  "description": "Site crawler with 408 retry support",
+  "main": "crawler.js",
+  "bin": {
+    "katamap-crawl": "./crawler.js"
+  },
+  "scripts": {
+    "crawl": "bun crawler.js"
+  },
+  "dependencies": {
+    "node-html-parser": "^6.1.13"
+  }
+}
+

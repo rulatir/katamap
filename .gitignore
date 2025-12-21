@@ -1,1 +1,5 @@
 /.idea/
+/discovered.txt
+/katamap.stderr.log
+/raw.jsonl
+/node_modules
