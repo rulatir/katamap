@@ -9,52 +9,66 @@
 import { parseArgs } from "util";
 import { writeFileSync } from "fs";
 import { parse as parseHtml } from "node-html-parser";
+import { decode as decodeHtmlEntities } from "he";
+import { HttpCache } from "./http-cache.js";
 
 const { values, positionals } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
     output: { type: "string", short: "o" },
     failed: { type: "string", short: "f" },
-    concurrency: { type: "string", short: "c", default: "20" },
+    concurrency: { type: "string", short: "j", default: "20" },
     retries: { type: "string", short: "r", default: "3" },
     followAll: { type: "boolean", short: "a", default: false },
     domain: { type: "string", short: "d", multiple: true },
+    contentOnly: { type: "boolean", short: "c", default: false },
+    store: { type: "string", short: "s" },
     help: { type: "boolean", short: "h" },
   },
   allowPositionals: true,
 });
 
 if (values.help || positionals.length < 1) {
-  console.error(`Usage: crawler.js <start_url> [-o output.txt] [-f failed.yaml] [-c concurrency] [-r retries] [-a] [-d host]...
+  console.error(`Usage: crawler.js [options] <start_url> [<start_url2> ...]
 
 Options:
   -o, --output <file>     Output file for discovered document URLs
   -f, --failed <file>     Output file for failed URLs (YAML, grouped by error)
-  -c, --concurrency <n>   Number of concurrent fetchers (default: 20)
+  -j, --concurrency <n>   Number of concurrent fetchers (default: 20)
   -r, --retries <n>       Number of retries for transient errors (default: 3)
   -a, --follow-all-links  Follow all links, including rel="nofollow"
+  -c, --content-only      Skip scanning JavaScript and CSS for URLs
+  -s, --store <dir>       Cache directory for HTTP responses (created if needed)
   -d, --domain <host>     Additional host to substitute with main host (can be repeated)
   -h, --help              Show this help
+
+Arguments:
+  <start_url>             One or more URLs to start crawling from
 `);
   process.exit(values.help ? 0 : 1);
 }
 
-const startUrl = positionals[0];
+const startUrls = positionals;
 const outputFile = values.output;
 const failedFile = values.failed;
 const concurrency = parseInt(values.concurrency, 10);
 const maxRetries = parseInt(values.retries, 10);
 const followAll = values.followAll;
+const contentOnly = values.contentOnly;
+const storeDir = values.store;
 
-// If starting URL is https, prefer https for all discovered URLs
-const preferHttps = startUrl.startsWith("https://");
+// Use first starting URL as reference for preferences
+const firstStartUrl = startUrls[0];
+const firstStartUrlParsed = new URL(firstStartUrl);
 
-// If starting URL has a non-standard port, prefer that port for discovered URLs
-const startUrlParsed = new URL(startUrl);
-const preferPort = startUrlParsed.port || null; // null means no port preference
+// If first starting URL is https, prefer https for all discovered URLs
+const preferHttps = firstStartUrl.startsWith("https://");
 
-// Main host for substitution
-const mainHost = startUrlParsed.hostname;
+// If first starting URL has a non-standard port, prefer that port for discovered URLs
+const preferPort = firstStartUrlParsed.port || null; // null means no port preference
+
+// Main host for substitution (from first starting URL)
+const mainHost = firstStartUrlParsed.hostname;
 
 // Additional hosts that should be substituted with main host
 const additionalHosts = new Set(values.domain || []);
@@ -93,20 +107,6 @@ function normalizeUrl(url) {
   }
 }
 
-// Decode common HTML entities in URLs
-function decodeHtmlEntities(str) {
-  if (!str) return str;
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
-}
-
 function extractLinks(html, baseUrl) {
   const links = new Set();
   try {
@@ -129,11 +129,12 @@ function extractLinks(html, baseUrl) {
     }
 
     // Data attributes that often contain URLs
-    for (const el of root.querySelectorAll("[data-url], [data-href], [data-src], [data-link]")) {
-      addLink(links, el.getAttribute("data-url"), baseUrl, base);
-      addLink(links, el.getAttribute("data-href"), baseUrl, base);
-      addLink(links, el.getAttribute("data-src"), baseUrl, base);
-      addLink(links, el.getAttribute("data-link"), baseUrl, base);
+    const dataAttrs = ["data-url", "data-href", "data-src", "data-link"];
+    const dataSelector = dataAttrs.map(attr => `[${attr}]`).join(", ");
+    for (const el of root.querySelectorAll(dataSelector)) {
+      for (const attr of dataAttrs) {
+        addLink(links, el.getAttribute(attr), baseUrl, base);
+      }
     }
 
     // Meta refresh redirects
@@ -152,18 +153,37 @@ function extractLinks(html, baseUrl) {
       }
     }
 
-    // Extract URLs from inline scripts and style blocks
-    const text = html;
-    extractUrlsFromText(links, text, baseUrl, base);
+    // Extract URLs from inline scripts and style blocks (unless content-only mode)
+    if (!contentOnly) {
+      const text = html;
+      extractUrlsFromText(links, text, baseUrl, base);
+    }
 
   } catch {}
   return links;
+}
+
+function looksLikeEmail(str) {
+  // Match common email patterns
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(str);
+}
+
+function looksLikePhoneNumber(str) {
+  // Match common phone number patterns (with or without country code, various separators)
+  // Examples: +1-234-567-8900, (123) 456-7890, 123.456.7890, 1234567890
+  const cleaned = str.replace(/[\s\-\.\(\)]/g, '');
+  // Check if it's mostly digits, possibly starting with +
+  return /^\+?\d{7,15}$/.test(cleaned);
 }
 
 function addLink(links, href, baseUrl, base) {
   if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:") || href.startsWith("tel:") || href.startsWith("data:")) return;
   // Decode HTML entities (e.g., &amp; -> &)
   const decoded = decodeHtmlEntities(href);
+
+  // Skip if it looks like an email address or phone number (even without mailto:/tel: prefix)
+  if (looksLikeEmail(decoded) || looksLikePhoneNumber(decoded)) return;
+
   try {
     const resolved = new URL(decoded, baseUrl);
     // Check if host is main host or an additional host
@@ -176,7 +196,7 @@ function addLink(links, href, baseUrl, base) {
       if (isAdditionalHost) {
         // Substitute main host, protocol, and clear port (normalizeUrl will apply preferred port)
         resolved.hostname = mainHost;
-        resolved.protocol = startUrlParsed.protocol;
+        resolved.protocol = firstStartUrlParsed.protocol;
         resolved.port = "";  // Let normalizeUrl handle port based on preferPort
       }
       const norm = normalizeUrl(resolved.href);
@@ -185,6 +205,18 @@ function addLink(links, href, baseUrl, base) {
   } catch {}
 }
 
+/**
+ * Extract URLs from plain text using regex patterns.
+ *
+ * This function complements DOM-based link extraction by finding URLs embedded in:
+ * - Inline JavaScript code (e.g., fetch("/api/users"), window.location = "/home")
+ * - CSS content (e.g., url('/images/bg.png'), @import "/styles.css")
+ * - String literals and other text content that wouldn't be captured by DOM attribute queries
+ *
+ * While DOM crawling handles structured HTML attributes (href, src, etc.), this function
+ * captures dynamically referenced URLs that only exist as string literals in script/style
+ * content. Both approaches are necessary for comprehensive URL discovery.
+ */
 function extractUrlsFromText(links, text, baseUrl, base) {
   // Common URL patterns in JS/CSS
   const patterns = [
@@ -225,6 +257,7 @@ const referrers = new Map();     // url -> Set of source URLs (tracks all pages 
 const queue = [];                // URLs to fetch: { url, attempts, canFallbackToHttp }
 let inFlight = 0;
 let done = false;
+let cache = null;                // HTTP response cache (initialized in main if --store is specified)
 
 // Add URL to queue if not seen
 function enqueue(linkOrUrl) {
@@ -268,9 +301,39 @@ function enqueue(linkOrUrl) {
   }
 }
 
+/**
+ * Process response body and extract links
+ */
+function processResponseBody(body, contentType, url) {
+  const isHtml = isHtmlType(contentType);
+  const ct = contentType.toLowerCase();
+  let links = new Set();
+
+  // Parse HTML for full link extraction
+  if (ct.includes("text/html")) {
+    links = extractLinks(body, url);
+  }
+  // Also extract URLs from JS and CSS (but these are not "documents" we track)
+  else if (!contentOnly && (ct.includes("javascript") || ct.includes("text/css"))) {
+    const base = new URL(url);
+    extractUrlsFromText(links, body, url, base);
+  }
+
+  return { isHtml, links };
+}
+
 // Retry-aware fetch with https->http and port->no-port fallback
-async function fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoPort, triedHttpFallback = false, triedNoPortFallback = false) {
+async function fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoPort, cache = null, triedHttpFallback = false, triedNoPortFallback = false) {
   const TRANSIENT_CODES = [408, 429, 500, 502, 503, 504];
+
+  // Check cache first
+  if (cache) {
+    const cached = cache.get(url);
+    if (cached) {
+      const { isHtml, links } = processResponseBody(cached.body, cached.contentType, url);
+      return { ok: true, isHtml, links, fetchedUrl: url, fromCache: true };
+    }
+  }
 
   try {
     const resp = await fetch(url, {
@@ -290,22 +353,18 @@ async function fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoP
     }
 
     const contentType = resp.headers.get("content-type") || "";
-    const isHtml = isHtmlType(contentType);
-    const ct = contentType.toLowerCase();
+    const body = await resp.text();
 
-    let links = new Set();
-    // Parse HTML for full link extraction
-    if (ct.includes("text/html")) {
-      const html = await resp.text();
-      links = extractLinks(html, url);
-    }
-    // Also extract URLs from JS and CSS (but these are not "documents" we track)
-    else if (ct.includes("javascript") || ct.includes("text/css")) {
-      const text = await resp.text();
-      const base = new URL(url);
-      extractUrlsFromText(links, text, url, base);
+    // Store in cache if available
+    if (cache) {
+      cache.set(url, {
+        status: resp.status,
+        contentType,
+        body
+      });
     }
 
+    const { isHtml, links } = processResponseBody(body, contentType, url);
     return { ok: true, isHtml, links, fetchedUrl: url };
   } catch (e) {
     const msg = e.message || String(e);
@@ -318,7 +377,7 @@ async function fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoP
           u.port = "";
           const noPortUrl = u.href;
           console.error(`[port-failed] ${url} (${msg}), trying without port...`);
-          return fetchWithRetry(noPortUrl, attempts, canFallbackToHttp, canFallbackToNoPort, triedHttpFallback, true);
+          return fetchWithRetry(noPortUrl, attempts, canFallbackToHttp, canFallbackToNoPort, cache, triedHttpFallback, true);
         }
       } catch {}
     }
@@ -327,7 +386,7 @@ async function fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoP
     if (canFallbackToHttp && !triedHttpFallback && url.startsWith("https://")) {
       const httpUrl = url.replace("https://", "http://");
       console.error(`[https-failed] ${url} (${msg}), trying http...`);
-      return fetchWithRetry(httpUrl, attempts, canFallbackToHttp, canFallbackToNoPort, true, triedNoPortFallback);
+      return fetchWithRetry(httpUrl, attempts, canFallbackToHttp, canFallbackToNoPort, cache, true, triedNoPortFallback);
     }
 
     // Retry on network errors
@@ -351,7 +410,7 @@ async function worker() {
     inFlight++;
     const { url, attempts, canFallbackToHttp, canFallbackToNoPort, cameFromAdditionalHost } = item;
 
-    const result = await fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoPort);
+    const result = await fetchWithRetry(url, attempts, canFallbackToHttp, canFallbackToNoPort, cache);
 
     if (result.retry) {
       // Only log retries for HTML pages (we don't know yet, so always log)
@@ -380,7 +439,8 @@ async function worker() {
           } catch {}
         }
         discovered.add(url);
-        console.log(url);
+        const cacheIndicator = result.fromCache ? " [cached]" : "";
+        console.log(url + cacheIndicator);
       }
       // Enqueue discovered links regardless of content type
       // Links are already normalized by addLink -> normalizeUrl, so port is added
@@ -421,9 +481,21 @@ async function progressReporter() {
 
 // Main
 async function main() {
-  console.error(`[start] ${startUrl} (concurrency=${concurrency}, retries=${maxRetries})`);
+  // Initialize cache if store directory is specified
+  if (storeDir) {
+    cache = new HttpCache(storeDir);
+    console.error(`[cache] enabled at ${storeDir}`);
+  }
 
-  enqueue(startUrl);
+  console.error(`[start] ${startUrls.length} URL(s) (concurrency=${concurrency}, retries=${maxRetries})`);
+  for (const url of startUrls) {
+    console.error(`  - ${url}`);
+  }
+
+  // Enqueue all starting URLs
+  for (const url of startUrls) {
+    enqueue(url);
+  }
 
   // Start workers
   const workers = [];
