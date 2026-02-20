@@ -7,12 +7,24 @@ import { createHash } from "crypto";
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 
+/**
+ * Generate a hash key for a URL
+ */
+export function hashUrl(url) {
+  return createHash("sha256").update(url).digest("hex");
+}
+
 export class HttpCache {
-  constructor(cacheDir) {
+  constructor(cacheDir, bodiesDir = null) {
     this.cacheDir = cacheDir;
-    // Create cache directory if it doesn't exist
-    if (!existsSync(cacheDir)) {
+    this.bodiesDir = bodiesDir;
+    // Create cache directory if it doesn't exist (cacheDir can be null for bodies-only mode)
+    if (cacheDir && !existsSync(cacheDir)) {
       mkdirSync(cacheDir, { recursive: true });
+    }
+    // Create bodies directory if specified
+    if (bodiesDir && !existsSync(bodiesDir)) {
+      mkdirSync(bodiesDir, { recursive: true });
     }
   }
 
@@ -20,7 +32,7 @@ export class HttpCache {
    * Generate a hash key for a URL
    */
   _hashUrl(url) {
-    return createHash("sha256").update(url).digest("hex");
+    return hashUrl(url);
   }
 
   /**
@@ -28,6 +40,11 @@ export class HttpCache {
    * @returns {Object|null} Cached response object or null if not found
    */
   get(url) {
+    // No caching if cacheDir is null
+    if (!this.cacheDir) {
+      return null;
+    }
+
     const hash = this._hashUrl(url);
     const cachePath = join(this.cacheDir, hash);
 
@@ -37,6 +54,15 @@ export class HttpCache {
 
     try {
       const cached = JSON.parse(readFileSync(cachePath, "utf-8"));
+      // Write body file if bodiesDir is configured
+      if (this.bodiesDir && cached.body !== undefined) {
+        const bodyPath = join(this.bodiesDir, hash);
+        try {
+          writeFileSync(bodyPath, cached.body, "utf-8");
+        } catch (e) {
+          console.error(`[bodies-error] Failed to write body for ${url}: ${e.message}`);
+        }
+      }
       return cached;
     } catch (e) {
       // If cache file is corrupted, treat as cache miss
@@ -51,18 +77,30 @@ export class HttpCache {
    */
   set(url, response) {
     const hash = this._hashUrl(url);
-    const cachePath = join(this.cacheDir, hash);
 
-    try {
-      const cacheData = {
-        url,
-        timestamp: new Date().toISOString(),
-        ...response
-      };
-      writeFileSync(cachePath, JSON.stringify(cacheData), "utf-8");
-    } catch (e) {
-      // Silently fail on cache write errors
-      console.error(`[cache-error] Failed to write cache for ${url}: ${e.message}`);
+    // Write cache file if cacheDir is configured
+    if (this.cacheDir) {
+      const cachePath = join(this.cacheDir, hash);
+      try {
+        const cacheData = {
+          url,
+          timestamp: new Date().toISOString(),
+          ...response
+        };
+        writeFileSync(cachePath, JSON.stringify(cacheData), "utf-8");
+      } catch (e) {
+        console.error(`[cache-error] Failed to write cache for ${url}: ${e.message}`);
+      }
+    }
+
+    // Write body file if bodiesDir is configured
+    if (this.bodiesDir && response.body !== undefined) {
+      const bodyPath = join(this.bodiesDir, hash);
+      try {
+        writeFileSync(bodyPath, response.body, "utf-8");
+      } catch (e) {
+        console.error(`[bodies-error] Failed to write body for ${url}: ${e.message}`);
+      }
     }
   }
 }

@@ -10,7 +10,10 @@
     "crawl": "bun crawler.js"
   },
   "dependencies": {
+    "fast-xml-parser": "^5.3.6",
     "he": "^1.2.0",
-    "node-html-parser": "^6.1.13"
+    "node-html-parser": "^6.1.13",
+    "sitemap-stream-parser": "^1.7.0",
+    "sitemapper": "^4.0.2"
   }
 }

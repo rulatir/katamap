@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+Match old website pages to new website pages based on text similarity.
+Outputs CSV of URL pairs for creating redirects.
+
+Modes:
+  - Direct mode: match-pages <old-texts-dir> <old-cache-dir> <new-texts-dir> <new-cache-dir>
+  - Project mode: match-pages (uses match-pages.json in current directory)
+"""
+
+import sys
+import json
+import subprocess
+import argparse
+import shutil
+from pathlib import Path
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+def read_text_file(path):
+    """Read text file, return content or empty string on error."""
+    try:
+        return path.read_text(encoding='utf-8')
+    except Exception as e:
+        print(f"[error] Failed to read {path}: {e}", file=sys.stderr)
+        return ""
+
+def read_cache_url(cache_dir, hash_name):
+    """Read original URL from cache JSON file."""
+    cache_path = cache_dir / hash_name
+    try:
+        data = json.loads(cache_path.read_text(encoding='utf-8'))
+        return data.get('url')
+    except Exception as e:
+        print(f"[error] Failed to read cache {cache_path}: {e}", file=sys.stderr)
+        return None
+
+def find_largest_gap(scores):
+    """Find index of largest gap in sorted scores."""
+    if len(scores) < 2:
+        return len(scores)
+
+    gaps = []
+    for i in range(len(scores) - 1):
+        gap = scores[i] - scores[i + 1]
+        gaps.append((i + 1, gap))  # Index after gap, gap size
+
+    if not gaps:
+        return len(scores)
+
+    # Find largest gap
+    largest_gap_idx, largest_gap_size = max(gaps, key=lambda x: x[1])
+
+    print(f"[gap] Largest gap: {largest_gap_size:.4f} at position {largest_gap_idx}", file=sys.stderr)
+    return largest_gap_idx
+
+def load_fixer_uppers(cache_dir):
+    """Load fixer-uppers mapping from JSON file relative to cache dir."""
+    fixer_uppers_file = cache_dir.parent / '.katamap-detail' / 'fixer-uppers.json'
+    if fixer_uppers_file.exists():
+        try:
+            data = json.loads(fixer_uppers_file.read_text(encoding='utf-8'))
+            print(f"[fixer-uppers] Loaded {len(data)} mappings from {fixer_uppers_file}", file=sys.stderr)
+            return data
+        except Exception as e:
+            print(f"[warning] Failed to load fixer-uppers from {fixer_uppers_file}: {e}", file=sys.stderr)
+    return {}
+
+def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, full_outer_join=False):
+    """Run the matching algorithm."""
+    # Validate directories
+    for d in [old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir]:
+        if not d.is_dir():
+            print(f"[error] Not a directory: {d}", file=sys.stderr)
+            sys.exit(1)
+
+    # Load fixer-uppers mappings (unfixed -> fixed)
+    old_fixer_uppers = load_fixer_uppers(old_cache_dir)
+    new_fixer_uppers = load_fixer_uppers(new_cache_dir)
+
+    # Read all text files (hash filenames)
+    print("[reading] Loading old site texts...", file=sys.stderr)
+    old_hashes = sorted([f.name for f in old_texts_dir.iterdir() if f.is_file()])
+    old_docs = [read_text_file(old_texts_dir / h) for h in old_hashes]
+
+    print("[reading] Loading new site texts...", file=sys.stderr)
+    new_hashes = sorted([f.name for f in new_texts_dir.iterdir() if f.is_file()])
+    new_docs = [read_text_file(new_texts_dir / h) for h in new_hashes]
+
+    print(f"[loaded] {len(old_docs)} old pages, {len(new_docs)} new pages", file=sys.stderr)
+
+    if not old_docs or not new_docs:
+        print("[error] No documents to compare", file=sys.stderr)
+        sys.exit(1)
+
+    # Filter out empty documents
+    old_valid = [(h, d) for h, d in zip(old_hashes, old_docs) if d.strip()]
+    new_valid = [(h, d) for h, d in zip(new_hashes, new_docs) if d.strip()]
+
+    if len(old_valid) < len(old_docs):
+        print(f"[warning] Filtered {len(old_docs) - len(old_valid)} empty old documents", file=sys.stderr)
+    if len(new_valid) < len(new_docs):
+        print(f"[warning] Filtered {len(new_docs) - len(new_valid)} empty new documents", file=sys.stderr)
+
+    old_hashes, old_docs = zip(*old_valid) if old_valid else ([], [])
+    new_hashes, new_docs = zip(*new_valid) if new_valid else ([], [])
+
+    if not old_docs or not new_docs:
+        print("[error] No valid documents after filtering", file=sys.stderr)
+        sys.exit(1)
+
+    # Compute TF-IDF vectors
+    print("[tfidf] Computing TF-IDF vectors...", file=sys.stderr)
+    vectorizer = TfidfVectorizer(
+        min_df=1,
+        stop_words='english',
+        max_features=10000
+    )
+
+    all_docs = list(old_docs) + list(new_docs)
+    tfidf_matrix = vectorizer.fit_transform(all_docs)
+
+    old_vectors = tfidf_matrix[:len(old_docs)]
+    new_vectors = tfidf_matrix[len(old_docs):]
+
+    # Compute similarity matrix
+    print("[similarity] Computing cosine similarities...", file=sys.stderr)
+    similarity_matrix = cosine_similarity(old_vectors, new_vectors)
+
+    # Find best match for each old page
+    matches = []
+    for i, old_hash in enumerate(old_hashes):
+        best_new_idx = np.argmax(similarity_matrix[i])
+        best_score = similarity_matrix[i][best_new_idx]
+        matches.append({
+            'old_hash': old_hash,
+            'new_hash': new_hashes[best_new_idx],
+            'score': best_score
+        })
+
+    # Sort by score descending
+    matches.sort(key=lambda x: x['score'], reverse=True)
+
+    print(f"[matches] Found {len(matches)} best matches", file=sys.stderr)
+    if matches:
+        print(f"[scores] Range: {matches[0]['score']:.4f} to {matches[-1]['score']:.4f}", file=sys.stderr)
+
+    # Find largest gap in scores
+    scores = [m['score'] for m in matches]
+    cutoff_idx = find_largest_gap(scores)
+
+    good_matches = matches[:cutoff_idx]
+    print(f"[cutoff] Keeping {len(good_matches)} matches above gap", file=sys.stderr)
+
+    if not good_matches:
+        print("[warning] No good matches found", file=sys.stderr)
+        sys.exit(0)
+
+    # Look up original URLs and output TSV
+    print("[urls] Looking up original URLs...", file=sys.stderr)
+    output_count = 0
+    matched_old_hashes = set()
+    matched_new_hashes = set()
+
+    # Output matched pairs
+    for match in good_matches:
+        old_url = read_cache_url(old_cache_dir, match['old_hash'])
+        new_url = read_cache_url(new_cache_dir, match['new_hash'])
+
+        if old_url and new_url:
+            print(f"{old_url}\t{new_url}")
+            output_count += 1
+            matched_old_hashes.add(match['old_hash'])
+            matched_new_hashes.add(match['new_hash'])
+        else:
+            if not old_url:
+                print(f"[warning] No URL for old hash {match['old_hash']}", file=sys.stderr)
+            if not new_url:
+                print(f"[warning] No URL for new hash {match['new_hash']}", file=sys.stderr)
+
+    print(f"[done] Output {output_count} URL pairs", file=sys.stderr)
+
+    # If full outer join requested, output unmatched URLs
+    if full_outer_join:
+        unmatched_old = 0
+        unmatched_new = 0
+        suppressed_old = 0
+        suppressed_new = 0
+
+        # Build reverse lookup: fixed -> unfixed
+        old_fixed_to_unfixed = {v: k for k, v in old_fixer_uppers.items()}
+        new_fixed_to_unfixed = {v: k for k, v in new_fixer_uppers.items()}
+
+        # Build set of matched URLs (not just hashes)
+        matched_old_urls = set()
+        matched_new_urls = set()
+        for match in good_matches:
+            old_url = read_cache_url(old_cache_dir, match['old_hash'])
+            new_url = read_cache_url(new_cache_dir, match['new_hash'])
+            if old_url:
+                matched_old_urls.add(old_url)
+            if new_url:
+                matched_new_urls.add(new_url)
+
+        # Output unmatched old URLs (left column only)
+        for old_hash in old_hashes:
+            if old_hash not in matched_old_hashes:
+                old_url = read_cache_url(old_cache_dir, old_hash)
+                if old_url:
+                    # Check if this is an unfixed URL whose fixed version is paired
+                    if old_url in old_fixer_uppers:
+                        fixed_url = old_fixer_uppers[old_url]
+                        if fixed_url in matched_old_urls:
+                            # Suppress: the fixed version is paired
+                            suppressed_old += 1
+                            continue
+                    print(f"{old_url}\t")
+                    unmatched_old += 1
+
+        # Output unmatched new URLs (right column only)
+        for new_hash in new_hashes:
+            if new_hash not in matched_new_hashes:
+                new_url = read_cache_url(new_cache_dir, new_hash)
+                if new_url:
+                    # Check if this is an unfixed URL whose fixed version is paired
+                    if new_url in new_fixer_uppers:
+                        fixed_url = new_fixer_uppers[new_url]
+                        if fixed_url in matched_new_urls:
+                            # Suppress: the fixed version is paired
+                            suppressed_new += 1
+                            continue
+                    print(f"\t{new_url}")
+                    unmatched_new += 1
+
+        print(f"[full-outer-join] Output {unmatched_old} unmatched old URLs, {unmatched_new} unmatched new URLs", file=sys.stderr)
+        if suppressed_old > 0 or suppressed_new > 0:
+            print(f"[full-outer-join] Suppressed {suppressed_old} old, {suppressed_new} new unfixed URLs (fixed versions paired)", file=sys.stderr)
+
+def prompt_for_config():
+    """Prompt user for project configuration."""
+    print("=== Match Pages Project Setup ===", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    config = {}
+
+    config['old_urls'] = input("Old site starting URLs (space-separated): ").strip().split()
+    config['old_domains'] = input("Old site extra domains (space-separated, or empty): ").strip().split()
+    config['new_urls'] = input("New site starting URLs (space-separated): ").strip().split()
+    config['new_domains'] = input("New site extra domains (space-separated, or empty): ").strip().split()
+
+    if not config['old_urls'] or not config['new_urls']:
+        print("[error] At least one starting URL required for both old and new sites", file=sys.stderr)
+        sys.exit(1)
+
+    return config
+
+def run_crawler(name, urls, domains, output_dir):
+    """Run crawler for a site."""
+    print(f"\n[{name}] Starting crawler...", file=sys.stderr)
+
+    # Locate crawler.js relative to this script
+    script_dir = Path(__file__).parent.resolve()
+    crawler_path = script_dir / 'crawler.js'
+
+    cmd = [
+        str(crawler_path),
+        '-c',  # content-only
+        '-j', '5',  # concurrency
+        '-r', '3',  # retries
+        '-s', f'{output_dir}/cache',
+        '-b', f'{output_dir}/files',
+        '-t', f'{output_dir}/text',
+        '-o', f'{output_dir}/urls.txt',
+        '-f', f'{output_dir}/failed.txt',
+    ]
+
+    # Add extra domains
+    for domain in domains:
+        cmd.extend(['-d', domain])
+
+    # Add starting URLs
+    cmd.extend(urls)
+
+    print(f"[{name}] Command: {' '.join(cmd)}", file=sys.stderr)
+
+    # Run crawler with both stdout and stderr going to our stderr (real-time)
+    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    if result.returncode != 0:
+        print(f"[{name}] Crawler failed with exit code {result.returncode}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[{name}] Crawler completed", file=sys.stderr)
+
+def project_mode(full_outer_join=False, fresh=False):
+    """Run in project mode - check for config, run crawlers, run matching."""
+    config_path = Path('match-pages.json')
+
+    if config_path.exists():
+        print("[project] Loading configuration from match-pages.json", file=sys.stderr)
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+
+        # Clean up old crawl data if --fresh specified
+        if fresh:
+            for site_dir in ['old', 'new']:
+                # Only remove specific crawler-created subdirectories
+                for subdir in ['cache', 'files', 'text', '.katamap-detail']:
+                    dir_path = Path(site_dir) / subdir
+                    if dir_path.exists():
+                        print(f"[fresh] Removing {dir_path}", file=sys.stderr)
+                        shutil.rmtree(dir_path)
+    else:
+        if fresh:
+            print("[warning] --fresh option ignored: no existing match-pages.json", file=sys.stderr)
+        config = prompt_for_config()
+        config_path.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
+        print(f"[project] Saved configuration to {config_path}", file=sys.stderr)
+
+    # Run crawlers
+    run_crawler('old', config['old_urls'], config['old_domains'], 'old')
+    run_crawler('new', config['new_urls'], config['new_domains'], 'new')
+
+    # Run matching
+    print("\n[project] Running page matching...", file=sys.stderr)
+    run_matching(
+        Path('old/text'),
+        Path('old/cache'),
+        Path('new/text'),
+        Path('new/cache'),
+        full_outer_join
+    )
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Match old website pages to new website pages',
+        usage='%(prog)s [options] [<old-texts-dir> <old-cache-dir> <new-texts-dir> <new-cache-dir>]'
+    )
+    parser.add_argument('-a', '--all', action='store_true',
+                        help='Full outer join: include unmatched old and new URLs')
+    parser.add_argument('-f', '--fresh', action='store_true',
+                        help='Project mode only: remove old crawl data before running')
+    parser.add_argument('dirs', nargs='*', help='Directories for direct mode')
+
+    args = parser.parse_args()
+
+    if len(args.dirs) == 4:
+        # Direct mode
+        if args.fresh:
+            print("[warning] --fresh option only applies to project mode", file=sys.stderr)
+        old_texts_dir = Path(args.dirs[0])
+        old_cache_dir = Path(args.dirs[1])
+        new_texts_dir = Path(args.dirs[2])
+        new_cache_dir = Path(args.dirs[3])
+        run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, args.all)
+    elif len(args.dirs) == 0:
+        # Project mode
+        project_mode(args.all, args.fresh)
+    else:
+        parser.print_help(sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
