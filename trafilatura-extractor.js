@@ -62,7 +62,7 @@ export async function extractWithTrafilatura(trafilaturaDir, bodiesDir, htmlHash
       const outputPath = join(trafilaturaDir, hash);
 
       try {
-        const result = Bun.spawn(["trafilatura", "-u", url], {
+        const result = Bun.spawn(["trafilatura", "-u", url, "--recall"], {
           stdout: "pipe",
           stderr: "pipe"
         });

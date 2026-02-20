@@ -67,7 +67,7 @@ def load_fixer_uppers(cache_dir):
             print(f"[warning] Failed to load fixer-uppers from {fixer_uppers_file}: {e}", file=sys.stderr)
     return {}
 
-def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, full_outer_join=False):
+def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, full_outer_join=False, debug_old_url=None, debug_new_url=None):
     """Run the matching algorithm."""
     # Validate directories
     for d in [old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir]:
@@ -124,6 +124,18 @@ def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, ful
     old_vectors = tfidf_matrix[:len(old_docs)]
     new_vectors = tfidf_matrix[len(old_docs):]
 
+    # Build URL to hash mappings for debugging
+    old_url_to_hash = {}
+    new_url_to_hash = {}
+    for old_hash in old_hashes:
+        url = read_cache_url(old_cache_dir, old_hash)
+        if url:
+            old_url_to_hash[url] = old_hash
+    for new_hash in new_hashes:
+        url = read_cache_url(new_cache_dir, new_hash)
+        if url:
+            new_url_to_hash[url] = new_hash
+
     # Compute similarity matrix
     print("[similarity] Computing cosine similarities...", file=sys.stderr)
     similarity_matrix = cosine_similarity(old_vectors, new_vectors)
@@ -136,7 +148,9 @@ def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, ful
         matches.append({
             'old_hash': old_hash,
             'new_hash': new_hashes[best_new_idx],
-            'score': best_score
+            'score': best_score,
+            'old_idx': i,
+            'new_idx': best_new_idx
         })
 
     # Sort by score descending
@@ -152,6 +166,77 @@ def run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, ful
 
     good_matches = matches[:cutoff_idx]
     print(f"[cutoff] Keeping {len(good_matches)} matches above gap", file=sys.stderr)
+
+    # Debug mode: analyze why expected match wasn't found
+    if debug_old_url or debug_new_url:
+        print("\n[debug] Match analysis:", file=sys.stderr)
+
+        if debug_old_url:
+            if debug_old_url not in old_url_to_hash:
+                print(f"[debug] ERROR: Old URL not found in crawl: {debug_old_url}", file=sys.stderr)
+            else:
+                old_hash = old_url_to_hash[debug_old_url]
+                old_idx = old_hashes.index(old_hash)
+
+                # Find the match for this old URL
+                actual_match = next((m for m in matches if m['old_hash'] == old_hash), None)
+                actual_new_url = read_cache_url(new_cache_dir, actual_match['new_hash']) if actual_match else None
+
+                print(f"[debug] Old URL: {debug_old_url}", file=sys.stderr)
+                print(f"[debug] Best match: {actual_new_url}", file=sys.stderr)
+                print(f"[debug] Similarity score: {actual_match['score']:.4f}", file=sys.stderr)
+                print(f"[debug] Match rank: #{matches.index(actual_match) + 1} of {len(matches)}", file=sys.stderr)
+                print(f"[debug] Above gap cutoff: {'YES' if matches.index(actual_match) < cutoff_idx else 'NO'}", file=sys.stderr)
+
+                # If expected new URL provided, check similarity with it
+                if debug_new_url:
+                    if debug_new_url not in new_url_to_hash:
+                        print(f"[debug] ERROR: Expected new URL not found in crawl: {debug_new_url}", file=sys.stderr)
+                    else:
+                        new_hash = new_url_to_hash[debug_new_url]
+                        new_idx = new_hashes.index(new_hash)
+                        expected_score = similarity_matrix[old_idx][new_idx]
+
+                        print(f"[debug] Expected new URL: {debug_new_url}", file=sys.stderr)
+                        print(f"[debug] Similarity with expected: {expected_score:.4f}", file=sys.stderr)
+                        print(f"[debug] Expected score vs best: {expected_score:.4f} vs {actual_match['score']:.4f} (diff: {actual_match['score'] - expected_score:.4f})", file=sys.stderr)
+
+                # Show top 5 candidates
+                row_scores = [(j, similarity_matrix[old_idx][j]) for j in range(len(new_hashes))]
+                row_scores.sort(key=lambda x: x[1], reverse=True)
+                print(f"[debug] Top 5 candidates:", file=sys.stderr)
+                for rank, (new_idx, score) in enumerate(row_scores[:5], 1):
+                    candidate_url = read_cache_url(new_cache_dir, new_hashes[new_idx])
+                    print(f"[debug]   {rank}. {score:.4f} - {candidate_url}", file=sys.stderr)
+
+        if debug_new_url and not debug_old_url:
+            if debug_new_url not in new_url_to_hash:
+                print(f"[debug] ERROR: New URL not found in crawl: {debug_new_url}", file=sys.stderr)
+            else:
+                new_hash = new_url_to_hash[debug_new_url]
+                new_idx = new_hashes.index(new_hash)
+
+                # Find which old URL(s) matched to this new URL
+                matches_to_this = [m for m in matches if m['new_hash'] == new_hash]
+
+                print(f"[debug] New URL: {debug_new_url}", file=sys.stderr)
+                if matches_to_this:
+                    for m in matches_to_this:
+                        old_url = read_cache_url(old_cache_dir, m['old_hash'])
+                        print(f"[debug] Matched by old URL: {old_url}", file=sys.stderr)
+                        print(f"[debug] Similarity score: {m['score']:.4f}", file=sys.stderr)
+                        print(f"[debug] Match rank: #{matches.index(m) + 1} of {len(matches)}", file=sys.stderr)
+                        print(f"[debug] Above gap cutoff: {'YES' if matches.index(m) < cutoff_idx else 'NO'}", file=sys.stderr)
+                else:
+                    print(f"[debug] This URL was never selected as best match for any old URL", file=sys.stderr)
+
+                # Show top 5 old URLs with highest similarity to this new URL
+                col_scores = [(i, similarity_matrix[i][new_idx]) for i in range(len(old_hashes))]
+                col_scores.sort(key=lambda x: x[1], reverse=True)
+                print(f"[debug] Top 5 similar old URLs:", file=sys.stderr)
+                for rank, (old_idx, score) in enumerate(col_scores[:5], 1):
+                    candidate_url = read_cache_url(old_cache_dir, old_hashes[old_idx])
+                    print(f"[debug]   {rank}. {score:.4f} - {candidate_url}", file=sys.stderr)
 
     if not good_matches:
         print("[warning] No good matches found", file=sys.stderr)
@@ -292,7 +377,7 @@ def run_crawler(name, urls, domains, output_dir):
 
     print(f"[{name}] Crawler completed", file=sys.stderr)
 
-def project_mode(full_outer_join=False, fresh=False):
+def project_mode(full_outer_join=False, fresh=False, debug_old_url=None, debug_new_url=None):
     """Run in project mode - check for config, run crawlers, run matching."""
     config_path = Path('match-pages.json')
 
@@ -327,7 +412,9 @@ def project_mode(full_outer_join=False, fresh=False):
         Path('old/cache'),
         Path('new/text'),
         Path('new/cache'),
-        full_outer_join
+        full_outer_join,
+        debug_old_url,
+        debug_new_url
     )
 
 def main():
@@ -339,6 +426,10 @@ def main():
                         help='Full outer join: include unmatched old and new URLs')
     parser.add_argument('-f', '--fresh', action='store_true',
                         help='Project mode only: remove old crawl data before running')
+    parser.add_argument('--debug-old', metavar='URL',
+                        help='Debug why this old URL didn\'t match as expected')
+    parser.add_argument('--debug-new', metavar='URL',
+                        help='Debug why this new URL didn\'t match as expected')
     parser.add_argument('dirs', nargs='*', help='Directories for direct mode')
 
     args = parser.parse_args()
@@ -351,10 +442,10 @@ def main():
         old_cache_dir = Path(args.dirs[1])
         new_texts_dir = Path(args.dirs[2])
         new_cache_dir = Path(args.dirs[3])
-        run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, args.all)
+        run_matching(old_texts_dir, old_cache_dir, new_texts_dir, new_cache_dir, args.all, args.debug_old, args.debug_new)
     elif len(args.dirs) == 0:
         # Project mode
-        project_mode(args.all, args.fresh)
+        project_mode(args.all, args.fresh, args.debug_old, args.debug_new)
     else:
         parser.print_help(sys.stderr)
         sys.exit(1)
